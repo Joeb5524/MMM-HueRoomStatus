@@ -1,0 +1,41 @@
+.hrs {
+    display: block;
+}
+
+.hrs__header {
+    font-size: 18px;
+    line-height: 1.2;
+    margin-bottom: 8px;
+}
+
+.hrs__list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.hrs__row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.hrs__icon {
+    width: 18px;
+    text-align: center;
+}
+
+.hrs__name {
+    font-size: 16px;
+}
+
+.hrs__dim {
+    opacity: 0.7;
+    font-size: 14px;
+}
+
+.hrs__error {
+    color: #ff6666;
+    font-size: 14px;
+    line-height: 1.3;
+}

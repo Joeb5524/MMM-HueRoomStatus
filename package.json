@@ -1,0 +1,11 @@
+{
+  "name": "hue-room-status",
+  "version": "1.0.0",
+  "description": "MagicMirror² module to show Philips Hue light status (with colour icons).",
+  "main": "node_helper.js",
+  "author": "Joe Ball",
+  "license": "MIT",
+  "dependencies": {
+    "node-fetch": "^2.6.7"
+  }
+}
