@@ -1,6 +1,6 @@
 /* global Module */
 
-Module.register("HueRoomStatus", {
+Module.register("MMM-HueRoomStatus", {
     defaults: {
         header: "Hue Lights",
         bridgeIp: "192.168.0.2",          // REQUIRED
