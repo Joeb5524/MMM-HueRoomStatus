@@ -14,10 +14,12 @@ module.exports = NodeHelper.create({
         this.config = this._sanitizeConfig(payload);
 
         if (!this.config.bridgeIp || !this.config.userId) {
-            this.sendSocketNotification("HRS_ERROR", {
-                message: "HueRoomStatus: bridgeIp and userId are required."
-            });
+            this.sendSocketNotification("HRS_ERROR", { message: "HueRoomStatus: bridgeIp and userId are required." });
             return;
+        }
+
+        if (Array.isArray(this._lastItems) && this._lastItems.length) {
+            this.sendSocketNotification("HRS_DATA", { items: this._lastItems });
         }
 
         this._startPolling();
