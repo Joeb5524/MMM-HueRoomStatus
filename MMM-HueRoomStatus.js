@@ -117,19 +117,18 @@ Module.register("MMM-HueRoomStatus", {
     },
 
     socketNotificationReceived(notification, payload) {
-        if (notification === "HRS_DATA") {
-            this._status = "OK";
-            this._lastError = null;
-            this._items = Array.isArray(payload?.items) ? payload.items : [];
-            this.updateDom(this.config.animationSpeed);
+        if (notification !== "HRS_CONFIG") return;
+
+        this.config = this._sanitizeConfig(payload);
+
+        if (!this.config.bridgeIp || !this.config.userId) {
+            this.sendSocketNotification("HRS_ERROR", { message: "HueRoomStatus: bridgeIp and userId are required." });
             return;
+        }
+        if (Array.isArray(this._lastItems) && this._lastItems.length) {
+            this.sendSocketNotification("HRS_DATA", { items: this._lastItems });
         }
 
-        if (notification === "HRS_ERROR") {
-            this._status = "ERROR";
-            this._lastError = payload?.message || "Unknown error";
-            this.updateDom(this.config.animationSpeed);
-            return;
-        }
-    }
+        this._startPolling();
+    },
 });
