@@ -21,6 +21,19 @@
     gap: 10px;
 }
 
+.hrs__row--clickable {
+    cursor: pointer;
+    user-select: none;
+}
+
+.hrs__row--clickable:hover {
+    opacity: 0.92;
+}
+
+.hrs__row--pending {
+    opacity: 0.75;
+}
+
 .hrs__icon {
     width: 18px;
     text-align: center;

@@ -6,7 +6,6 @@ Shows Philips Hue **light** status (on/off/unreachable) on MagicMirror², with o
 
 ```bash
 cd ~/MagicMirror/modules
-mkdir HueRoomStatus
-# copy files into HueRoomStatus/
-cd HueRoomStatus
+git clone https://github.com/joeb5524/MMM-HueRoomStatus.git
+cd ./MMM-HueRoomStatus
 npm install

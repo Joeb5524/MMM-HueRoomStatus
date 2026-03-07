@@ -1,301 +1,379 @@
 const NodeHelper = require("node_helper");
 const fetch = require("node-fetch");
+const https = require("https");
 
 module.exports = NodeHelper.create({
     start() {
         this.config = null;
         this._timer = null;
+
         this._lastItems = [];
+        this._lastAllItems = [];
+
+        this._httpsAgent = new https.Agent({ rejectUnauthorized: false });
+        this._rateLimiter = new RateLimiter({ minIntervalMs: 120 });
     },
 
     socketNotificationReceived(notification, payload) {
-        if (notification !== "HRS_CONFIG") return;
+        if (notification === "HRS_CONFIG") {
+            this.config = this._sanitizeConfig(payload);
 
-        this.config = this._sanitizeConfig(payload);
+            if (!this.config.bridgeIp) {
+                this.sendSocketNotification("HRS_ERROR", { message: "HueRoomStatus: bridgeIp required" });
+                return;
+            }
 
-        if (!this.config.bridgeIp || !this.config.userId) {
-            this.sendSocketNotification("HRS_ERROR", { message: "HueRoomStatus: bridgeIp and userId are required." });
+            const api = this._determineApi();
+            if (api === "v2" && !this.config.hueApplicationKey) {
+                this.sendSocketNotification("HRS_ERROR", { message: "HueRoomStatus: hueApplicationKey required for v2" });
+                return;
+            }
+            if (api === "v1" && !this.config.userId) {
+                this.sendSocketNotification("HRS_ERROR", { message: "HueRoomStatus: userId required for v1" });
+                return;
+            }
+
+            this._httpsAgent = new https.Agent({ rejectUnauthorized: !this.config.insecureSkipVerify });
+
+            this._startPolling();
             return;
         }
 
-        if (Array.isArray(this._lastItems) && this._lastItems.length) {
-            this.sendSocketNotification("HRS_DATA", { items: this._lastItems });
+        if (notification === "HRS_SET_STATE") {
+            this._handleSetState(payload)
+                .catch(err => this.sendSocketNotification("HRS_CMD_ERROR", { id: payload && payload.id, message: err.message }));
+            return;
         }
 
-        this._startPolling();
+        if (notification === "HRS_HUE_COMMAND") {
+            this._handleHueCommand(payload)
+                .catch(err => this.sendSocketNotification("HRS_CMD_ERROR", { message: err.message }));
+        }
     },
 
     _sanitizeConfig(cfg) {
         const safe = { ...cfg };
-
-        safe.refreshMs = Number.isFinite(Number(safe.refreshMs))
-            ? Math.max(5_000, Number(safe.refreshMs))
-            : 60_000;
-
-        safe.hideNameContains = Array.isArray(safe.hideNameContains)
-            ? safe.hideNameContains.map(String)
-            : [];
-
-        safe.showOnlyOn = !!safe.showOnlyOn;
-        safe.colour = safe.colour !== false;
+        safe.refreshMs = Number.isFinite(Number(safe.refreshMs)) ? Math.max(5000, Number(safe.refreshMs)) : 60000;
+        safe.hideNameContains = Array.isArray(safe.hideNameContains) ? safe.hideNameContains.map(String).filter(Boolean) : [];
         safe.mode = safe.mode === "groups" ? "groups" : "lights";
-        safe.showUnreachable = safe.showUnreachable !== false;
-
+        safe.apiVersion = safe.apiVersion || "auto";
+        safe.bridgeIp = safe.bridgeIp ? String(safe.bridgeIp) : "";
+        safe.hueApplicationKey = safe.hueApplicationKey ? String(safe.hueApplicationKey) : "";
+        safe.userId = safe.userId ? String(safe.userId) : "";
+        safe.insecureSkipVerify = safe.insecureSkipVerify !== false;
+        safe.colour = safe.colour !== false;
         return safe;
+    },
+
+    _determineApi() {
+        const v = String(this.config.apiVersion || "auto").toLowerCase();
+        if (v === "v2" || v === "2") return "v2";
+        if (v === "v1" || v === "1") return "v1";
+        return this.config.hueApplicationKey ? "v2" : "v1";
     },
 
     _startPolling() {
         if (this._timer) clearInterval(this._timer);
 
-        // Immediately fetch once
-        this._pollOnce().catch(() => {  });
-
-        this._timer = setInterval(() => {
-            this._pollOnce().catch(() => {  });
-        }, this.config.refreshMs);
+        this._pollOnce().catch(() => {});
+        this._timer = setInterval(() => this._pollOnce().catch(() => {}), this.config.refreshMs);
     },
 
     async _pollOnce() {
-        const { bridgeIp, userId, mode } = this.config;
-        const url = `http://${bridgeIp}/api/${encodeURIComponent(userId)}/${mode}`;
+        if (!this.config) return;
 
-        let json;
-        try {
-            const res = await fetch(url, { method: "GET", timeout: 8000 });
-            if (!res.ok) {
-                throw new Error(`Hue HTTP ${res.status} ${res.statusText}`);
-            }
-            json = await res.json();
-        } catch (err) {
-            this.sendSocketNotification("HRS_ERROR", {
-                message: `HueRoomStatus: Failed to fetch from bridge (${err.message}).`
-            });
-            return;
-        }
+        const api = this._determineApi();
+        const allItems = api === "v2" ? await this._pollOnceV2() : await this._pollOnceV1();
+        this._lastAllItems = allItems;
 
-        try {
-            const items = mode === "groups"
-                ? this._normalizeGroups(json)
-                : this._normalizeLights(json);
+        const items = this._applyFilters(allItems);
+        this._lastItems = items;
 
-            const filtered = this._applyFilters(items);
-
-            // only push if changed
-            const changed = JSON.stringify(filtered) !== JSON.stringify(this._lastItems);
-            if (changed) {
-                this._lastItems = filtered;
-                this.sendSocketNotification("HRS_DATA", { items: filtered });
-            } else {
-
-            }
-        } catch (err) {
-            this.sendSocketNotification("HRS_ERROR", {
-                message: `HueRoomStatus: Error parsing Hue payload (${err.message}).`
-            });
-        }
+        this.sendSocketNotification("HRS_DATA", { items });
     },
 
     _applyFilters(items) {
-        const { showOnlyOn, hideNameContains, showUnreachable } = this.config;
-        const needles = (hideNameContains || [])
-            .map(s => String(s).toLowerCase())
-            .filter(Boolean);
-
-        return items.filter(it => {
-            if (!showUnreachable && it.reachable === false) return false;
-            if (showOnlyOn && !it.on) return false;
-            if (needles.length) {
-                const n = String(it.name || "").toLowerCase();
-                if (needles.some(x => n.includes(x))) return false;
-            }
+        const needles = this.config.hideNameContains.map(s => String(s).toLowerCase());
+        return (items || []).filter(it => {
+            const n = String(it.name || "").toLowerCase();
+            if (needles.some(x => n.includes(x))) return false;
             return true;
+        }).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    },
+
+    async _pollOnceV1() {
+        const url = `https://${this.config.bridgeIp}/api/${encodeURIComponent(this.config.userId)}/${this.config.mode}`;
+        const res = await fetch(url, { method: "GET", timeout: 10000, agent: this._httpsAgent });
+        if (!res.ok) throw new Error(`Hue v1 GET failed ${res.status}`);
+        const json = await res.json();
+
+        return (this.config.mode === "groups") ? normalizeV1Groups(json) : normalizeV1Lights(json, this.config.colour);
+    },
+
+    async _pollOnceV2() {
+        const headers = { "hue-application-key": this.config.hueApplicationKey, "Accept": "application/json" };
+        const base = `https://${this.config.bridgeIp}`;
+
+        if (this.config.mode === "groups") {
+            const grouped = await v2Get(`${base}/clip/v2/resource/grouped_light`, headers, this._httpsAgent);
+            const rooms = await v2Get(`${base}/clip/v2/resource/room`, headers, this._httpsAgent).catch(() => ({ data: [] }));
+            const roomNameById = new Map((rooms.data || []).map(r => [String(r.id), String(r?.metadata?.name || r.id)]));
+            return normalizeV2Grouped(grouped.data || [], roomNameById, this.config.colour);
+        }
+
+        const lights = await v2Get(`${base}/clip/v2/resource/light`, headers, this._httpsAgent);
+        return normalizeV2Lights(lights.data || [], this.config.colour);
+    },
+
+    async _handleSetState(payload) {
+        const id = payload && payload.id ? String(payload.id) : null;
+        const type = payload && payload.type ? String(payload.type) : (this.config.mode === "groups" ? "group" : "light");
+        const on = payload && typeof payload.on === "boolean" ? payload.on : null;
+        if (!id || typeof on !== "boolean") throw new Error("Invalid toggle payload");
+
+        const api = this._determineApi();
+
+        await this._rateLimiter.enqueue(async () => {
+            if (api === "v2") return this._v2SetState({ id, type, on });
+            return this._v1SetState({ id, type, on });
         });
+
+        this.sendSocketNotification("HRS_CMD_OK", { id });
+        setTimeout(() => this._pollOnce().catch(() => {}), 450);
     },
 
-    _normalizeLights(obj) {
+    async _handleHueCommand(cmd) {
+        const action = String(cmd && (cmd.action || cmd.intent || cmd.command) || "").toLowerCase();
+        const rgb = cmd && (cmd.rgb || cmd.color || cmd.colour) ? String(cmd.rgb || cmd.color || cmd.colour) : null;
+        const targetName = String(cmd && (cmd.target || cmd.room || cmd.group || cmd.targetName) || "");
+        const targetId = cmd && (cmd.id || cmd.targetId) ? String(cmd.id || cmd.targetId) : null;
 
-        // light has: name, state: { on, reachable, bri, xy, hue, sat, ct, colormode }
-        const items = [];
-        for (const id of Object.keys(obj || {})) {
-            const light = obj[id] || {};
-            const state = light.state || {};
+        const items = Array.isArray(this._lastAllItems) ? this._lastAllItems : [];
+        if (!items.length) throw new Error("No Hue cache yet");
 
-            const on = !!state.on;
-            const reachable = state.reachable !== false;
+        const targets = resolveTargets(items, { targetId, targetName });
+        if (!targets.length) throw new Error("No matching Hue items");
 
-            const rgb = this.config.colour && on && reachable
-                ? this._deriveCssRgb(state)
-                : null;
+        const api = this._determineApi();
 
-            items.push({
-                id,
-                type: "light",
-                name: light.name || `Light ${id}`,
-                on,
-                reachable,
-                rgb
+        for (const t of targets) {
+            const id = String(t.id);
+            const type = String(t.type || "light");
+
+            let on;
+            if (action === "on" || action === "turn_on") on = true;
+            else if (action === "off" || action === "turn_off") on = false;
+            else if (action === "toggle") on = !t.on;
+
+            await this._rateLimiter.enqueue(async () => {
+                if (api === "v2") return this._v2SetState({ id, type, on, rgb: (action === "color" || action === "rgb") ? rgb : null });
+                return this._v1SetState({ id, type, on, rgb: (action === "color" || action === "rgb") ? rgb : null });
             });
+
+            this.sendSocketNotification("HRS_CMD_OK", { id });
         }
 
-        // Keep stable ordering by name
-        items.sort((a, b) => String(a.name).localeCompare(String(b.name)));
-        return items;
+        setTimeout(() => this._pollOnce().catch(() => {}), 650);
     },
 
-    _normalizeGroups(obj) {
+    async _v1SetState({ id, type, on, rgb }) {
+        const isGroup = String(type) === "group" || this.config.mode === "groups";
+        const path = isGroup
+            ? `/api/${encodeURIComponent(this.config.userId)}/groups/${encodeURIComponent(id)}/action`
+            : `/api/${encodeURIComponent(this.config.userId)}/lights/${encodeURIComponent(id)}/state`;
 
-        //  group has: name, state.any_on, state.all_on, lights[], etc.
-        const items = [];
-        for (const id of Object.keys(obj || {})) {
-            const group = obj[id] || {};
-            const state = group.state || {};
-            const anyOn = !!state.any_on;
+        const url = `https://${this.config.bridgeIp}${path}`;
+        const body = {};
+        if (typeof on === "boolean") body.on = on;
 
-
-            items.push({
-                id,
-                type: "group",
-                name: group.name || `Group ${id}`,
-                on: anyOn,
-                reachable: true,
-                rgb: null
-            });
+        if (rgb) {
+            const { r, g, b } = parseCssOrHexRgb(rgb);
+            const xy = rgbToXy(r, g, b);
+            body.xy = [xy.x, xy.y];
+            if (typeof on !== "boolean") body.on = true;
         }
 
-        items.sort((a, b) => String(a.name).localeCompare(String(b.name)));
-        return items;
+        const res = await fetch(url, {
+            method: "PUT",
+            timeout: 10000,
+            agent: this._httpsAgent,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body)
+        });
+        if (!res.ok) throw new Error(`Hue v1 PUT failed ${res.status}`);
     },
 
-    _deriveCssRgb(state) {
+    async _v2SetState({ id, type, on, rgb }) {
+        const isGroup = String(type) === "group";
+        const rtype = isGroup ? "grouped_light" : "light";
 
-        const bri = Number.isFinite(Number(state.bri)) ? Number(state.bri) : 254;
+        const url = `https://${this.config.bridgeIp}/clip/v2/resource/${rtype}/${encodeURIComponent(id)}`;
+        const headers = { "hue-application-key": this.config.hueApplicationKey, "Accept": "application/json", "Content-Type": "application/json" };
 
-        if (Array.isArray(state.xy) && state.xy.length === 2) {
-            const [x, y] = state.xy.map(Number);
-            if (Number.isFinite(x) && Number.isFinite(y) && y > 0) {
-                const { r, g, b } = this._xyBriToRgb(x, y, bri);
-                return `rgb(${r},${g},${b})`;
-            }
+        const body = {};
+        if (typeof on === "boolean") body.on = { on };
+        if (rgb) {
+            const { r, g, b } = parseCssOrHexRgb(rgb);
+            const xy = rgbToXy(r, g, b);
+            body.color = { xy: { x: xy.x, y: xy.y } };
+            if (typeof on !== "boolean") body.on = { on: true };
         }
 
-
-        if (Number.isFinite(Number(state.hue)) && Number.isFinite(Number(state.sat))) {
-            const hue = Number(state.hue);
-            const sat = Number(state.sat);
-            const { r, g, b } = this._hueSatBriToRgb(hue, sat, bri);
-            return `rgb(${r},${g},${b})`;
-        }
-
-
-        if (Number.isFinite(Number(state.ct))) {
-            const ct = Number(state.ct);
-            const { r, g, b } = this._ctBriToRgb(ct, bri);
-            return `rgb(${r},${g},${b})`;
-        }
-
-        return null;
-    },
-
-    _clamp8(n) {
-        return Math.max(0, Math.min(255, Math.round(n)));
-    },
-
-    _xyBriToRgb(x, y, bri) {
-
-        const z = 1.0 - x - y;
-        const Y = Math.max(0, Math.min(1, bri / 254)); // luminance
-        const X = (Y / y) * x;
-        const Z = (Y / y) * z;
-
-
-        let r =  X *  1.656492 - Y * 0.354851 - Z * 0.255038;
-        let g = -X *  0.707196 + Y * 1.655397 + Z * 0.036152;
-        let b =  X *  0.051713 - Y * 0.121364 + Z * 1.011530;
-
-
-        r = Math.max(0, r);
-        g = Math.max(0, g);
-        b = Math.max(0, b);
-
-
-        const max = Math.max(r, g, b);
-        if (max > 1) {
-            r /= max; g /= max; b /= max;
-        }
-
-
-        const gamma = (c) => (c <= 0.0031308 ? 12.92 * c : (1.0 + 0.055) * Math.pow(c, 1.0 / 2.4) - 0.055);
-
-        r = gamma(r);
-        g = gamma(g);
-        b = gamma(b);
-
-        return {
-            r: this._clamp8(r * 255),
-            g: this._clamp8(g * 255),
-            b: this._clamp8(b * 255)
-        };
-    },
-
-    _hueSatBriToRgb(hue, sat, bri) {
-
-        const h = (hue % 65535) / 65535;   // 0..1
-        const s = Math.max(0, Math.min(1, sat / 254));
-        const v = Math.max(0, Math.min(1, bri / 254));
-
-
-        const i = Math.floor(h * 6);
-        const f = h * 6 - i;
-        const p = v * (1 - s);
-        const q = v * (1 - f * s);
-        const t = v * (1 - (1 - f) * s);
-
-        let r, g, b;
-        switch (i % 6) {
-            case 0: r = v; g = t; b = p; break;
-            case 1: r = q; g = v; b = p; break;
-            case 2: r = p; g = v; b = t; break;
-            case 3: r = p; g = q; b = v; break;
-            case 4: r = t; g = p; b = v; break;
-            case 5: r = v; g = p; b = q; break;
-        }
-
-        return {
-            r: this._clamp8(r * 255),
-            g: this._clamp8(g * 255),
-            b: this._clamp8(b * 255)
-        };
-    },
-
-    _ctBriToRgb(ct, bri) {
-
-        const mired = Math.max(153, Math.min(500, ct));
-        const kelvin = 1_000_000 / mired;
-
-
-        let temp = kelvin / 100;
-
-        let r, g, b;
-
-        // r
-        if (temp <= 66) r = 255;
-        else r = 329.698727446 * Math.pow(temp - 60, -0.1332047592);
-
-        // g
-        if (temp <= 66) g = 99.4708025861 * Math.log(temp) - 161.1195681661;
-        else g = 288.1221695283 * Math.pow(temp - 60, -0.0755148492);
-
-        // b
-        if (temp >= 66) b = 255;
-        else if (temp <= 19) b = 0;
-        else b = 138.5177312231 * Math.log(temp - 10) - 305.0447927307;
-
-        // apply brightness (v)
-        const v = Math.max(0, Math.min(1, bri / 254));
-        return {
-            r: this._clamp8(r * v),
-            g: this._clamp8(g * v),
-            b: this._clamp8(b * v)
-        };
+        const res = await fetch(url, { method: "PUT", timeout: 10000, agent: this._httpsAgent, headers, body: JSON.stringify(body) });
+        if (!res.ok) throw new Error(`Hue v2 PUT failed ${res.status}`);
     }
 });
+
+async function v2Get(url, headers, agent) {
+    const res = await fetch(url, { method: "GET", timeout: 10000, agent, headers });
+    if (!res.ok) throw new Error(`Hue v2 GET failed ${res.status}`);
+    return res.json();
+}
+
+function resolveTargets(items, { targetId, targetName }) {
+    if (targetId) {
+        const t = items.find(x => String(x.id) === String(targetId));
+        return t ? [t] : [];
+    }
+    const name = String(targetName || "").trim().toLowerCase();
+    if (!name || name === "all") return items;
+    return items.filter(x => String(x.name || "").toLowerCase().includes(name));
+}
+
+class RateLimiter {
+    constructor({ minIntervalMs }) {
+        this.min = Math.max(0, Number(minIntervalMs) || 0);
+        this._p = Promise.resolve();
+        this._last = 0;
+    }
+    enqueue(fn) {
+        this._p = this._p.then(async () => {
+            const now = Date.now();
+            const wait = Math.max(0, this.min - (now - this._last));
+            if (wait) await new Promise(r => setTimeout(r, wait));
+            const out = await fn();
+            this._last = Date.now();
+            return out;
+        });
+        return this._p;
+    }
+}
+
+function normalizeV1Lights(obj, colour) {
+    const items = [];
+    for (const id of Object.keys(obj || {})) {
+        const light = obj[id] || {};
+        const state = light.state || {};
+        const on = !!state.on;
+        const reachable = state.reachable !== false;
+        const rgb = (colour && on && reachable) ? deriveCssRgbFromV1State(state) : null;
+        items.push({ id: String(id), type: "light", name: light.name || `Light ${id}`, on, reachable, rgb });
+    }
+    return items;
+}
+
+function normalizeV1Groups(obj) {
+    const items = [];
+    for (const id of Object.keys(obj || {})) {
+        const g = obj[id] || {};
+        const anyOn = !!(g.state && g.state.any_on);
+        items.push({ id: String(id), type: "group", name: g.name || `Group ${id}`, on: anyOn, reachable: true, rgb: null });
+    }
+    return items;
+}
+
+function normalizeV2Lights(list, colour) {
+    const items = [];
+    for (const l of (list || [])) {
+        const id = String(l.id);
+        const name = l?.metadata?.name ? String(l.metadata.name) : `Light ${id}`;
+        const on = !!l?.on?.on;
+        const xy = (Number.isFinite(Number(l?.color?.xy?.x)) && Number.isFinite(Number(l?.color?.xy?.y)))
+            ? { x: Number(l.color.xy.x), y: Number(l.color.xy.y) } : null;
+        const briPct = Number.isFinite(Number(l?.dimming?.brightness)) ? Number(l.dimming.brightness) : 100;
+        const bri254 = Math.max(1, Math.min(254, Math.round(briPct * 254 / 100)));
+        const rgb = (colour && on) ? deriveCssRgbFromXy({ xy, bri: bri254 }) : null;
+
+        items.push({ id, type: "light", name, on, reachable: true, rgb });
+    }
+    return items;
+}
+
+function normalizeV2Grouped(list, roomNameById, colour) {
+    const items = [];
+    for (const g of (list || [])) {
+        const id = String(g.id);
+        const ownerRid = g?.owner?.rid ? String(g.owner.rid) : null;
+        const name = ownerRid ? (roomNameById.get(ownerRid) || `Group ${id}`) : `Group ${id}`;
+        const on = !!g?.on?.on;
+
+        const xy = (Number.isFinite(Number(g?.color?.xy?.x)) && Number.isFinite(Number(g?.color?.xy?.y)))
+            ? { x: Number(g.color.xy.x), y: Number(g.color.xy.y) } : null;
+        const briPct = Number.isFinite(Number(g?.dimming?.brightness)) ? Number(g.dimming.brightness) : 100;
+        const bri254 = Math.max(1, Math.min(254, Math.round(briPct * 254 / 100)));
+        const rgb = (colour && on) ? deriveCssRgbFromXy({ xy, bri: bri254 }) : null;
+
+        items.push({ id, type: "group", name, on, reachable: true, rgb });
+    }
+    return items;
+}
+
+function parseCssOrHexRgb(input) {
+    const s = String(input || "").trim().toLowerCase();
+    const hex = s.match(/^#([0-9a-f]{6})$/i);
+    if (hex) {
+        const n = parseInt(hex[1], 16);
+        return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+    }
+    const rgb = s.match(/^rgb\(\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})\s*\)$/);
+    if (rgb) return { r: clamp8(rgb[1]), g: clamp8(rgb[2]), b: clamp8(rgb[3]) };
+    return { r: 255, g: 255, b: 255 };
+}
+function clamp8(n) { return Math.max(0, Math.min(255, Math.round(Number(n) || 0))); }
+
+function rgbToXy(r8, g8, b8) {
+    let r = r8 / 255, g = g8 / 255, b = b8 / 255;
+    r = r > 0.04045 ? Math.pow((r + 0.055) / 1.055, 2.4) : r / 12.92;
+    g = g > 0.04045 ? Math.pow((g + 0.055) / 1.055, 2.4) : g / 12.92;
+    b = b > 0.04045 ? Math.pow((b + 0.055) / 1.055, 2.4) : b / 12.92;
+
+    const X = r * 0.664511 + g * 0.154324 + b * 0.162028;
+    const Y = r * 0.283881 + g * 0.668433 + b * 0.047685;
+    const Z = r * 0.000088 + g * 0.07231 + b * 0.986039;
+    const sum = X + Y + Z || 1;
+    return { x: X / sum, y: Y / sum };
+}
+
+function xyBriToRgb(x, y, bri) {
+    const Y = Math.max(0, Math.min(1, bri / 254));
+    const X = (Y / y) * x;
+    const Z = (Y / y) * (1 - x - y);
+
+    let r = X * 1.656492 - Y * 0.354851 - Z * 0.255038;
+    let g = -X * 0.707196 + Y * 1.655397 + Z * 0.036152;
+    let b = X * 0.051713 - Y * 0.121364 + Z * 1.01153;
+
+    r = r <= 0.0031308 ? 12.92 * r : 1.055 * Math.pow(r, 1 / 2.4) - 0.055;
+    g = g <= 0.0031308 ? 12.92 * g : 1.055 * Math.pow(g, 1 / 2.4) - 0.055;
+    b = b <= 0.0031308 ? 12.92 * b : 1.055 * Math.pow(b, 1 / 2.4) - 0.055;
+
+    r = Math.max(0, r); g = Math.max(0, g); b = Math.max(0, b);
+    const max = Math.max(r, g, b);
+    if (max > 1) { r /= max; g /= max; b /= max; }
+
+    return { r: clamp8(r * 255), g: clamp8(g * 255), b: clamp8(b * 255) };
+}
+
+function deriveCssRgbFromXy({ xy, bri }) {
+    if (!xy || !Number.isFinite(xy.x) || !Number.isFinite(xy.y) || xy.y <= 0) return null;
+    const { r, g, b } = xyBriToRgb(Number(xy.x), Number(xy.y), Number(bri) || 254);
+    return `rgb(${r},${g},${b})`;
+}
+
+function deriveCssRgbFromV1State(state) {
+    if (Array.isArray(state.xy) && state.xy.length === 2) {
+        const { r, g, b } = xyBriToRgb(Number(state.xy[0]), Number(state.xy[1]), Number(state.bri) || 254);
+        return `rgb(${r},${g},${b})`;
+    }
+    return null;
+}
