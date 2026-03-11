@@ -1,11 +1,24 @@
 const NodeHelper = require("node_helper");
-const fetch = require("node-fetch");
 
 module.exports = NodeHelper.create({
-    start() {
+    async start() {
         this.config = null;
         this._timer = null;
         this._lastItems = [];
+        this._pollInFlight = false;
+        this._activeAbortController = null;
+        this._fetchImpl = await this._resolveFetch();
+    },
+
+    stop() {
+        if (this._timer) clearInterval(this._timer);
+        this._timer = null;
+        if (this._activeAbortController) {
+            try {
+                this._activeAbortController.abort();
+            } catch (_) {}
+        }
+        this._activeAbortController = null;
     },
 
     socketNotificationReceived(notification, payload) {
@@ -29,7 +42,7 @@ module.exports = NodeHelper.create({
 
         if (notification === "HRS_TOGGLE" && payload) {
             this._setLightState(payload.id, { on: !!payload.on })
-                .then(() => this._pollOnce())
+                .then(() => this._pollOnce(true))
                 .catch((err) => {
                     this.sendSocketNotification("HRS_ERROR", {
                         message: `HueRoomStatus: Toggle failed (${err.message}).`
@@ -40,7 +53,7 @@ module.exports = NodeHelper.create({
 
         if (notification === "HRS_COMMAND" && payload) {
             this._handleCommand(payload)
-                .then(() => this._pollOnce())
+                .then(() => this._pollOnce(true))
                 .catch((err) => {
                     this.sendSocketNotification("HRS_ERROR", {
                         message: `HueRoomStatus: Command failed (${err.message}).`
@@ -50,11 +63,15 @@ module.exports = NodeHelper.create({
     },
 
     _sanitizeConfig(cfg) {
-        const safe = { ...cfg };
+        const safe = { ...(cfg || {}) };
 
         safe.refreshMs = Number.isFinite(Number(safe.refreshMs))
             ? Math.max(5000, Number(safe.refreshMs))
             : 60000;
+
+        safe.requestTimeoutMs = Number.isFinite(Number(safe.requestTimeoutMs))
+            ? Math.max(1000, Number(safe.requestTimeoutMs))
+            : 8000;
 
         safe.hideNameContains = Array.isArray(safe.hideNameContains)
             ? safe.hideNameContains.map(String)
@@ -71,33 +88,24 @@ module.exports = NodeHelper.create({
 
     _startPolling() {
         if (this._timer) clearInterval(this._timer);
+        this._timer = null;
 
-        this._pollOnce().catch(() => {});
+        this._pollOnce(true).catch(() => {});
 
         this._timer = setInterval(() => {
-            this._pollOnce().catch(() => {});
+            this._pollOnce(false).catch(() => {});
         }, this.config.refreshMs);
     },
 
-    async _pollOnce() {
-        const { bridgeIp, userId, mode } = this.config;
-        const url = `http://${bridgeIp}/api/${encodeURIComponent(userId)}/${mode}`;
+    async _pollOnce(forceEmit) {
+        if (!this.config || this._pollInFlight) return;
 
-        let json;
+        this._pollInFlight = true;
         try {
-            const res = await fetch(url, { method: "GET", timeout: 8000 });
-            if (!res.ok) {
-                throw new Error(`Hue HTTP ${res.status} ${res.statusText}`);
-            }
-            json = await res.json();
-        } catch (err) {
-            this.sendSocketNotification("HRS_ERROR", {
-                message: `HueRoomStatus: Failed to fetch from bridge (${err.message}).`
-            });
-            return;
-        }
+            const { bridgeIp, userId, mode } = this.config;
+            const url = `http://${bridgeIp}/api/${encodeURIComponent(userId)}/${mode}`;
 
-        try {
+            const json = await this._fetchJson(url);
             const items = mode === "groups"
                 ? this._normalizeGroups(json)
                 : this._normalizeLights(json);
@@ -105,14 +113,16 @@ module.exports = NodeHelper.create({
             const filtered = this._applyFilters(items);
             const changed = JSON.stringify(filtered) !== JSON.stringify(this._lastItems);
 
-            if (changed) {
+            if (changed || forceEmit) {
                 this._lastItems = filtered;
                 this.sendSocketNotification("HRS_DATA", { items: filtered });
             }
         } catch (err) {
             this.sendSocketNotification("HRS_ERROR", {
-                message: `HueRoomStatus: Error parsing Hue payload (${err.message}).`
+                message: `HueRoomStatus: Failed to fetch from bridge (${err.message}).`
             });
+        } finally {
+            this._pollInFlight = false;
         }
     },
 
@@ -138,10 +148,8 @@ module.exports = NodeHelper.create({
         for (const id of Object.keys(obj || {})) {
             const light = obj[id] || {};
             const state = light.state || {};
-
             const on = !!state.on;
             const reachable = state.reachable !== false;
-
             const rgb = this.config.colour && on && reachable
                 ? this._deriveCssRgb(state)
                 : null;
@@ -164,8 +172,10 @@ module.exports = NodeHelper.create({
         const items = [];
         for (const id of Object.keys(obj || {})) {
             const group = obj[id] || {};
+            const action = group.action || {};
             const state = group.state || {};
-            const anyOn = !!state.any_on;
+            const anyOn = typeof state.any_on === "boolean" ? state.any_on : !!action.on;
+            const rgb = this.config.colour && anyOn ? this._deriveCssRgb(action) : null;
 
             items.push({
                 id,
@@ -173,7 +183,7 @@ module.exports = NodeHelper.create({
                 name: group.name || `Group ${id}`,
                 on: anyOn,
                 reachable: true,
-                rgb: null
+                rgb
             });
         }
 
@@ -183,22 +193,25 @@ module.exports = NodeHelper.create({
 
     async _handleCommand(payload) {
         const action = String(payload.action || "").toLowerCase();
+        const targets = this._resolveTargets(payload);
 
         if (this.config.mode !== "lights") {
             throw new Error("Voice light control currently expects mode: lights");
         }
 
-        const lights = Array.isArray(this._lastItems) ? this._lastItems : [];
+        if (!targets.length) {
+            throw new Error("No matching lights found");
+        }
 
         if (action === "on" || action === "off") {
-            for (const item of lights) {
+            for (const item of targets) {
                 await this._setLightState(item.id, { on: action === "on" });
             }
             return;
         }
 
         if (action === "toggle") {
-            for (const item of lights) {
+            for (const item of targets) {
                 await this._setLightState(item.id, { on: !item.on });
             }
             return;
@@ -206,13 +219,32 @@ module.exports = NodeHelper.create({
 
         if (action === "color" && payload.rgb) {
             const xy = this._hexToXy(payload.rgb);
-            for (const item of lights) {
+            for (const item of targets) {
                 await this._setLightState(item.id, { on: true, xy });
             }
             return;
         }
 
         throw new Error("Unsupported Hue command");
+    },
+
+    _resolveTargets(payload) {
+        const items = Array.isArray(this._lastItems) ? this._lastItems : [];
+        const ids = Array.isArray(payload && payload.ids)
+            ? payload.ids.map((x) => String(x))
+            : [];
+        const singleId = payload && payload.id != null ? String(payload.id) : "";
+        const name = payload && payload.name ? String(payload.name).toLowerCase() : "";
+        const nameContains = payload && payload.nameContains ? String(payload.nameContains).toLowerCase() : "";
+
+        let targets = items;
+
+        if (singleId) targets = targets.filter((x) => String(x.id) === singleId);
+        if (ids.length) targets = targets.filter((x) => ids.includes(String(x.id)));
+        if (name) targets = targets.filter((x) => String(x.name || "").toLowerCase() === name);
+        if (nameContains) targets = targets.filter((x) => String(x.name || "").toLowerCase().includes(nameContains));
+
+        return targets;
     },
 
     async _setLightState(id, state) {
@@ -223,15 +255,94 @@ module.exports = NodeHelper.create({
         if (typeof state.on === "boolean") body.on = state.on;
         if (Array.isArray(state.xy)) body.xy = state.xy;
 
-        const res = await fetch(url, {
-            method: "PUT",
-            timeout: 8000,
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body)
+        await this._putJson(url, body);
+    },
+
+    async _resolveFetch() {
+        if (typeof fetch === "function") {
+            return fetch.bind(globalThis);
+        }
+
+        try {
+            const mod = require("node-fetch");
+            return (mod.default || mod);
+        } catch (_) {
+            throw new Error("No fetch implementation available");
+        }
+    },
+
+    async _fetchJson(url) {
+        const res = await this._fetchWithTimeout(url, {
+            method: "GET"
         });
 
         if (!res.ok) {
             throw new Error(`Hue HTTP ${res.status} ${res.statusText}`);
+        }
+
+        const json = await res.json();
+        this._throwHueApiErrors(json);
+        return json;
+    },
+
+    async _putJson(url, body) {
+        const res = await this._fetchWithTimeout(url, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body || {})
+        });
+
+        if (!res.ok) {
+            throw new Error(`Hue HTTP ${res.status} ${res.statusText}`);
+        }
+
+        const json = await res.json().catch(() => null);
+        this._throwHueApiErrors(json);
+        return json;
+    },
+
+    async _fetchWithTimeout(url, options) {
+        const timeoutMs = Number(this.config && this.config.requestTimeoutMs) || 8000;
+        const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+        let timer = null;
+
+        if (controller) {
+            this._activeAbortController = controller;
+            timer = setTimeout(() => {
+                try {
+                    controller.abort();
+                } catch (_) {}
+            }, timeoutMs);
+        }
+
+        try {
+            const fetchOptions = controller
+                ? { ...(options || {}), signal: controller.signal }
+                : { ...(options || {}) };
+
+            return await this._fetchImpl(url, fetchOptions);
+        } catch (err) {
+            if (err && (err.name === "AbortError" || /aborted/i.test(String(err.message || "")))) {
+                throw new Error(`request timed out after ${timeoutMs}ms`);
+            }
+            throw err;
+        } finally {
+            if (timer) clearTimeout(timer);
+            if (this._activeAbortController === controller) {
+                this._activeAbortController = null;
+            }
+        }
+    },
+
+    _throwHueApiErrors(json) {
+        if (!Array.isArray(json)) return;
+
+        const errors = json
+            .filter((entry) => entry && entry.error)
+            .map((entry) => entry.error.description || entry.error.type || "Unknown Hue API error");
+
+        if (errors.length) {
+            throw new Error(errors.join("; "));
         }
     },
 
@@ -315,7 +426,10 @@ module.exports = NodeHelper.create({
         const q = v * (1 - f * s);
         const t = v * (1 - (1 - f) * s);
 
-        let r, g, b;
+        let r;
+        let g;
+        let b;
+
         switch (i % 6) {
             case 0: r = v; g = t; b = p; break;
             case 1: r = q; g = v; b = p; break;
@@ -336,8 +450,10 @@ module.exports = NodeHelper.create({
         const mired = Math.max(153, Math.min(500, ct));
         const kelvin = 1000000 / mired;
 
-        let temp = kelvin / 100;
-        let r, g, b;
+        const temp = kelvin / 100;
+        let r;
+        let g;
+        let b;
 
         if (temp <= 66) r = 255;
         else r = 329.698727446 * Math.pow(temp - 60, -0.1332047592);
