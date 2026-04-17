@@ -19,6 +19,11 @@
     display: flex;
     align-items: center;
     gap: 10px;
+    padding: 10px 12px;
+    border-radius: 14px;
+    background: rgba(255,255,255,.06);
+    border: 1px solid rgba(255,255,255,.08);
+    transition: background .15s ease, transform .15s ease;
 }
 
 .hrs__row--clickable {
@@ -27,7 +32,8 @@
 }
 
 .hrs__row--clickable:hover {
-    opacity: 0.92;
+    background: rgba(105,213,255,.10);
+    transform: translateX(2px);
 }
 
 .hrs__row--pending {
@@ -35,8 +41,12 @@
 }
 
 .hrs__icon {
-    width: 18px;
-    text-align: center;
+    width: 24px;
+    height: 24px;
+    display: grid;
+    place-items: center;
+    border-radius: 999px;
+    background: rgba(255,255,255,.06);
 }
 
 .hrs__name {
